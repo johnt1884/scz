@@ -1073,7 +1073,7 @@
             <p>Any shortcuts more recent than this time will be considered new.</p>
             <div style="margin: 20px 0;">
                 <label for="cutoff-datetime" style="display: block; margin-bottom: 8px;">Date/Time (Local):</label>
-                <input type="datetime-local" id="cutoff-datetime" style="width: 100%; padding: 8px; box-sizing: border-box;">
+                <input type="datetime-local" id="cutoff-datetime" step="1" style="width: 100%; padding: 8px; box-sizing: border-box;">
             </div>
             <div style="display: flex; justify-content: flex-end; gap: 10px;">
                 <button id="cutoff-cancel-btn" class="bar-button" style="background-color: #f44336; color: white;">Cancel</button>
@@ -2878,21 +2878,27 @@
                         text = text.substring(1);
                     }
                     // Basic M3U parsing, skipping comments
-                    originalPlaylistShortcuts = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+                    originalPlaylistShortcuts = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#')).map(s => {
+                        const file = s.split(/[\\/]/).pop();
+                        const projectDir = s.split(/[\\/]/).slice(-3, -2)[0] || ""; // Assuming ..\Project\sc\video.lnk
+                        return { full: s, file: file.toLowerCase(), project: projectDir.toLowerCase() };
+                    });
 
                     // Show cutoff modal
                     const localDate = new Date(file.lastModified);
                     const offset = localDate.getTimezoneOffset();
                     localDate.setMinutes(localDate.getMinutes() - offset);
-                    cutoffDatetimeInput.value = localDate.toISOString().slice(0, 16);
+                    const defaultVal = localDate.toISOString().slice(0, 19);
+                    cutoffDatetimeInput.value = defaultVal;
                     cutoffModal.style.display = 'flex';
 
                     const cutoffPromise = new Promise((resolve, reject) => {
                         cutoffConfirmBtn.onclick = () => {
                             const val = cutoffDatetimeInput.value;
-                            if (val) {
+                            if (val && val !== defaultVal) {
                                 resolve(new Date(val).getTime());
                             } else {
+                                // Use the exact original modification time to avoid UI precision loss
                                 resolve(file.lastModified);
                             }
                             cutoffModal.style.display = 'none';
@@ -5172,59 +5178,77 @@
             if (!dateStr) return NaN;
             let mtimeStr = dateStr.trim();
 
-            // Handle DD/MM/YYYY or MM/DD/YYYY formats
-            const dateMatch = mtimeStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})(.*)$/);
-            if (dateMatch) {
-                let v1 = parseInt(dateMatch[1]);
-                let v2 = parseInt(dateMatch[2]);
-                let year = dateMatch[3];
+            // 1. Detect and handle YYYY-MM-DD vs DD/MM/YYYY or MM/DD/YYYY
+            const isoMatch = mtimeStr.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(.*)$/);
+            const ukMatch = mtimeStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})(.*)$/);
+
+            let year, month, day, rest;
+
+            if (isoMatch) {
+                year = isoMatch[1];
+                month = isoMatch[2].padStart(2, '0');
+                day = isoMatch[3].padStart(2, '0');
+                rest = isoMatch[4].trim();
+                // If it starts with T, remove it for the regex below
+                if (rest.toUpperCase().startsWith('T')) rest = rest.substring(1).trim();
+            } else if (ukMatch) {
+                let v1 = parseInt(ukMatch[1]);
+                let v2 = parseInt(ukMatch[2]);
+                year = ukMatch[3];
                 if (year.length === 2) year = "20" + year;
-                const rest = dateMatch[4].trim();
+                rest = ukMatch[4].trim();
 
-                let day, month;
                 if (v1 > 12) {
-                    day = v1; month = v2;
+                    day = String(v1).padStart(2, '0');
+                    month = String(v2).padStart(2, '0');
                 } else if (v2 > 12) {
-                    month = v1; day = v2;
+                    month = String(v1).padStart(2, '0');
+                    day = String(v2).padStart(2, '0');
                 } else {
-                    day = v1; month = v2; // Ambiguous, assume UK format
+                    day = String(v1).padStart(2, '0');
+                    month = String(v2).padStart(2, '0');
                 }
+            }
 
-                mtimeStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+            if (year && month && day) {
+                mtimeStr = `${year}-${month}-${day}`;
                 if (rest) {
-                    const timeMatch = rest.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?(\s*[AP]M)?/i);
+                    const timeMatch = rest.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?(\.\d+)?(\s*[AP]M)?/i);
                     if (timeMatch) {
                         let hh = parseInt(timeMatch[1]);
                         const mm = timeMatch[2];
                         const ss = timeMatch[3] || "00";
-                        const ampm = timeMatch[4];
+                        const ms = timeMatch[4] || "";
+                        const ampm = timeMatch[5];
 
                         if (ampm) {
                             if (ampm.toUpperCase().includes('PM') && hh < 12) hh += 12;
                             if (ampm.toUpperCase().includes('AM') && hh === 12) hh = 0;
                         }
-                        mtimeStr += `T${String(hh).padStart(2, '0')}:${mm}:${ss}`;
+                        mtimeStr += `T${String(hh).padStart(2, '0')}:${mm}:${ss}${ms}`;
+
+                        const tzPart = rest.substring(timeMatch[0].length).trim();
+                        if (tzPart.match(/^[+-]\d{2}:?\d{2}$/) || tzPart.toUpperCase() === 'Z') {
+                            mtimeStr += tzPart;
+                        }
                     }
                 }
             }
 
-            // Handle space between date and time for ISO-like strings
-            if (mtimeStr.includes(' ') && !mtimeStr.includes('T')) {
-                mtimeStr = mtimeStr.replace(/\s+/g, 'T');
-            }
-
-            // Final ISO normalization
-            mtimeStr = mtimeStr.replace(/\s+/g, '');
-
-            // If no timezone is provided, assume UTC as per instructions
-            if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.includes('+') && !mtimeStr.includes('-')) {
+            if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.match(/[+-]\d{2}:?\d{2}$/)) {
+                if (mtimeStr.includes(' ')) mtimeStr = mtimeStr.replace(/\s+/g, 'T');
+                if (!mtimeStr.includes('T')) mtimeStr += 'T00:00:00';
+                if (mtimeStr.endsWith('.')) mtimeStr = mtimeStr.slice(0, -1);
                 mtimeStr += 'Z';
             }
 
             const ts = new Date(mtimeStr).getTime();
             if (isNaN(ts)) {
-                // Last ditch effort for weird formats
-                return new Date(dateStr).getTime();
+                let fallbackStr = dateStr.trim();
+                if (fallbackStr.match(/^\d{4}-\d{2}-\d{2}/) && !fallbackStr.includes('Z') && !fallbackStr.includes('+')) {
+                    fallbackStr += 'Z';
+                }
+                return new Date(fallbackStr).getTime();
             }
             return ts;
         }
@@ -5415,14 +5439,16 @@
                         const parts = line.trim().split('|');
                         if (parts.length >= 2) {
                             const scName = parts[0].toLowerCase();
+                            let project = "", video = "", mtime = NaN;
                             parts.slice(1).forEach(part => {
-                                if (part.startsWith('sc_mtime:')) {
-                                    const mtime = parseShortcutDate(part.substring(9).trim());
-                                    if (!isNaN(mtime)) {
-                                        rootShortcutDates.set(scName, mtime);
-                                    }
-                                }
+                                if (part.startsWith('sc_project:')) project = part.substring(11).toLowerCase();
+                                else if (part.startsWith('sc_video:')) video = part.substring(9).toLowerCase();
+                                else if (part.startsWith('sc_mtime:')) mtime = parseShortcutDate(part.substring(9).trim());
                             });
+                            if (!isNaN(mtime)) {
+                                if (project && video) rootShortcutDates.set(`${project}|${video}`, mtime);
+                                else rootShortcutDates.set(scName, mtime);
+                            }
                         }
                     });
                     console.log(`Loaded ${rootShortcutDates.size} shortcut dates from root misc.txt.`);
@@ -5662,7 +5688,11 @@
                         // In update-playlist-root mode, we ALSO check if the shortcut file exists directly in sc/
                         let scDate = null;
                         if (currentMode === 'update-playlist-root') {
-                            scDate = getShortcutDate(videoFile.name, rootShortcutDates);
+                            // Try precise project|video lookup first
+                            scDate = rootShortcutDates.get(`${project.name.toLowerCase()}|${videoFile.name.toLowerCase()}`) || null;
+                            if (scDate === null) {
+                                scDate = getShortcutDate(videoFile.name, rootShortcutDates);
+                            }
                             // Fallback to project-level dates if not found in root dates
                             if (scDate === null) {
                                 scDate = getShortcutDate(videoFile.name, allShortcutDates);
@@ -5679,13 +5709,28 @@
                                     continue;
                                 }
                             } else if (currentMode === 'update-playlist-root') {
+                                const vNameLower = videoFile.name.toLowerCase();
+                                const vBaseLower = videoFile.name.substring(0, videoFile.name.lastIndexOf('.')).toLowerCase();
+                                const pNameLower = project.name.toLowerCase();
+
+                                const isExisting = originalPlaylistShortcuts.some(s => {
+                                    if (s.project && s.project !== pNameLower) return false;
+                                    const scFile = s.file;
+                                    const scBase = scFile.replace(/\.(lnk|ink| - shortcut\.lnk)$/i, "");
+                                    return scFile === vNameLower || scFile === vNameLower + ".lnk" || scFile === vNameLower + ".ink" ||
+                                           scBase === vNameLower || scBase === vBaseLower ||
+                                           (vBaseLower && (scBase === vBaseLower || scFile === vBaseLower));
+                                });
+
                                 const effectiveDate = scDate;
                                 // In update-playlist-root mode, we ONLY want to see shortcuts that are NEWER than the cutoff date.
-                                // This prevents showing "old" shortcuts that the user has already processed and are already in the playlist.
+                                // AND they should not already be in the playlist.
                                 const isNew = effectiveDate && (!playlistCreationTime || (effectiveDate > (playlistCreationTime + 1000)));
 
-                                if (!isNew) {
-                                    // Not a new shortcut based on cutoff
+                                console.log(`[UpdatePlaylist] Checking ${videoFile.name}: scDate=${effectiveDate ? new Date(effectiveDate).toISOString() : 'null'}, cutoff=${playlistCreationTime ? new Date(playlistCreationTime).toISOString() : 'null'}, isNew=${isNew}, isExisting=${isExisting}`);
+
+                                if (!isNew || isExisting) {
+                                    // Not a new shortcut or already in playlist
                                     continue;
                                 }
 
