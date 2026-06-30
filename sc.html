@@ -5071,10 +5071,7 @@
                 if (part.startsWith('backup_original:')) {
                     sel.backupOriginal = (part.substring(16).trim() === 'true');
                 } else if (part.startsWith('sc_mtime:')) {
-                    let mtimeStr = part.substring(9).trim();
-                    if (mtimeStr.includes(' ') && !mtimeStr.includes('T')) mtimeStr = mtimeStr.replace(' ', 'T');
-                    if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.includes('+') && !mtimeStr.includes('-')) mtimeStr += 'Z';
-                    const mtime = new Date(mtimeStr).getTime();
+                    const mtime = parseShortcutDate(part.substring(9).trim());
                     if (!isNaN(mtime)) {
                         allShortcutDates.set(videoName.toLowerCase(), mtime);
                     }
@@ -5169,6 +5166,43 @@
                 }
             }
             return false;
+        }
+
+        function parseShortcutDate(dateStr) {
+            if (!dateStr) return NaN;
+            let mtimeStr = dateStr.trim();
+
+            // Handle DD/MM/YYYY format
+            const ddmmyyyyMatch = mtimeStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(.*)$/);
+            if (ddmmyyyyMatch) {
+                const day = ddmmyyyyMatch[1].padStart(2, '0');
+                const month = ddmmyyyyMatch[2].padStart(2, '0');
+                const year = ddmmyyyyMatch[3];
+                const rest = ddmmyyyyMatch[4].trim();
+
+                // Reformat to YYYY-MM-DD for reliable parsing
+                mtimeStr = `${year}-${month}-${day}`;
+                if (rest) {
+                    const cleanRest = rest.trim();
+                    if (cleanRest.includes(' ') && !cleanRest.includes('T')) {
+                        mtimeStr += 'T' + cleanRest.replace(' ', 'T');
+                    } else if (!cleanRest.includes('T') && cleanRest.match(/^\d{2}:\d{2}/)) {
+                        mtimeStr += 'T' + cleanRest;
+                    } else {
+                        mtimeStr += (cleanRest.startsWith('T') ? '' : 'T') + cleanRest;
+                    }
+                }
+            }
+
+            // Handle space between date and time for ISO compatibility
+            if (mtimeStr.includes(' ') && !mtimeStr.includes('T')) {
+                mtimeStr = mtimeStr.replace(' ', 'T');
+            }
+            // If no timezone is provided, assume UTC as per instructions
+            if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.includes('+') && !mtimeStr.includes('-')) {
+                mtimeStr += 'Z';
+            }
+            return new Date(mtimeStr).getTime();
         }
 
         function getShortcutDate(videoName, dateMap) {
@@ -5356,16 +5390,7 @@
                             const scName = parts[0].toLowerCase();
                             parts.slice(1).forEach(part => {
                                 if (part.startsWith('sc_mtime:')) {
-                                    let mtimeStr = part.substring(9).trim();
-                                    // Handle space between date and time for ISO compatibility
-                                    if (mtimeStr.includes(' ') && !mtimeStr.includes('T')) {
-                                        mtimeStr = mtimeStr.replace(' ', 'T');
-                                    }
-                                    // If no timezone is provided, assume UTC as per instructions
-                                    if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.includes('+') && !mtimeStr.includes('-')) {
-                                        mtimeStr += 'Z';
-                                    }
-                                    const mtime = new Date(mtimeStr).getTime();
+                                    const mtime = parseShortcutDate(part.substring(9).trim());
                                     if (!isNaN(mtime)) {
                                         rootShortcutDates.set(scName, mtime);
                                     }
