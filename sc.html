@@ -5858,9 +5858,11 @@
                         const isRoot = hasRootSc || (rootScEntry === 'ROOT' || rootScEntry === 'BOTH');
                         const isSub = hasProjectSc === true || (rootScEntry === 'BOTH');
 
-                        if (isRoot && isSub) initialShortcutType = 'both-sc';
-                        else if (isRoot) initialShortcutType = 'root-sc';
-                        else if (isSub) initialShortcutType = 'subfolder-sc';
+                        if (currentMode !== 'update-playlist-root') {
+                            if (isRoot && isSub) initialShortcutType = 'both-sc';
+                            else if (isRoot) initialShortcutType = 'root-sc';
+                            else if (isSub) initialShortcutType = 'subfolder-sc';
+                        }
 
                         const key = project.path + '|' + videoFile.name;
                         const loadedEditState = editModeRotatedVideos.get(key);
@@ -6637,7 +6639,8 @@
 
             if (currentMode === 'update-playlist-root' && originalPlaylistShortcuts.length > 0) {
                 scriptLines.push('# --- Adding Original Playlist Shortcuts ---');
-                originalPlaylistShortcuts.forEach(scPath => {
+                originalPlaylistShortcuts.forEach(scPathObj => {
+                    const scPath = scPathObj.full;
                     const scFileName = scPath.split(/[\\/]/).pop();
                     const videoName = scFileName.replace(/\.(lnk|ink)$/i, '');
                     scriptLines.push(`Add-PlaylistEntry -path '${escapePSString(scPath)}' -rotation '0' -multiplier 1 -rotationKey '${escapePSString(videoName)}'`);
