@@ -1067,6 +1067,21 @@
         </div>
     </div>
 
+    <div id="cutoff-modal" class="modal">
+        <div class="modal-content" style="max-width: 400px;">
+            <h2 style="margin-top: 0;">Playlist Cut-off Date/Time</h2>
+            <p>Any shortcuts more recent than this time will be considered new.</p>
+            <div style="margin: 20px 0;">
+                <label for="cutoff-datetime" style="display: block; margin-bottom: 8px;">Date/Time (Local):</label>
+                <input type="datetime-local" id="cutoff-datetime" style="width: 100%; padding: 8px; box-sizing: border-box;">
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: 10px;">
+                <button id="cutoff-cancel-btn" class="bar-button" style="background-color: #f44336; color: white;">Cancel</button>
+                <button id="cutoff-confirm-btn" class="bar-button" style="background-color: #43a047; color: white;">Confirm</button>
+            </div>
+        </div>
+    </div>
+
 
     <script>
         const thumbnailContainer = document.getElementById('thumbnail-container');
@@ -1085,6 +1100,10 @@
         const createPlaylistLoadBtn = document.getElementById('create-playlist-load-btn');
         const createPlaylistRootLoadBtn = document.getElementById('create-playlist-root-load-btn');
         const updatePlaylistRootLoadBtn = document.getElementById('update-playlist-root-load-btn');
+        const cutoffModal = document.getElementById('cutoff-modal');
+        const cutoffDatetimeInput = document.getElementById('cutoff-datetime');
+        const cutoffConfirmBtn = document.getElementById('cutoff-confirm-btn');
+        const cutoffCancelBtn = document.getElementById('cutoff-cancel-btn');
         const shortcutScriptBtn = document.getElementById('shortcut-script-btn');
         const createPlaylistBtn = document.getElementById('create-playlist-btn');
         const deleteShortcutsBtn = document.getElementById('delete-shortcuts-btn');
@@ -2852,7 +2871,6 @@
                         }]
                     });
                     const file = await fileHandle.getFile();
-                    playlistCreationTime = file.lastModified;
                     let text = await file.text();
                     // Remove UTF-8 BOM if present
                     if (text.charCodeAt(0) === 0xFEFF) {
@@ -2861,6 +2879,31 @@
                     // Basic M3U parsing, skipping comments
                     originalPlaylistShortcuts = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
 
+                    // Show cutoff modal
+                    const localDate = new Date(file.lastModified);
+                    const offset = localDate.getTimezoneOffset();
+                    localDate.setMinutes(localDate.getMinutes() - offset);
+                    cutoffDatetimeInput.value = localDate.toISOString().slice(0, 16);
+                    cutoffModal.style.display = 'flex';
+
+                    const cutoffPromise = new Promise((resolve, reject) => {
+                        cutoffConfirmBtn.onclick = () => {
+                            const val = cutoffDatetimeInput.value;
+                            if (val) {
+                                resolve(new Date(val).getTime());
+                            } else {
+                                resolve(file.lastModified);
+                            }
+                            cutoffModal.style.display = 'none';
+                        };
+                        cutoffCancelBtn.onclick = () => {
+                            reject(new Error('AbortError'));
+                            cutoffModal.style.display = 'none';
+                        };
+                    });
+
+                    playlistCreationTime = await cutoffPromise;
+
                     const dirHandle = await window.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     currentMode = 'update-playlist-root';
@@ -2868,7 +2911,7 @@
                     setVisibilityForMode(currentMode);
                     await renderVideosInternal(false, sortSelector.value, true);
                 } catch (err) {
-                    if (err.name !== 'AbortError') {
+                    if (err.message !== 'AbortError' && err.name !== 'AbortError') {
                         console.error('Failed to open playlist or directory:', err);
                     }
                 }
@@ -5303,7 +5346,11 @@
                             const scName = parts[0].toLowerCase();
                             parts.slice(1).forEach(part => {
                                 if (part.startsWith('sc_mtime:')) {
-                                    const mtimeStr = part.substring(9).trim();
+                                    let mtimeStr = part.substring(9).trim();
+                                    // If no timezone is provided, assume UTC as per instructions
+                                    if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.includes('+') && !mtimeStr.includes('-')) {
+                                        mtimeStr += 'Z';
+                                    }
                                     const mtime = new Date(mtimeStr).getTime();
                                     if (!isNaN(mtime)) {
                                         rootShortcutDates.set(scName, mtime);
@@ -5595,7 +5642,7 @@
                         rowDiv.dataset.projectPath = project.path;
                         rowDiv.dataset.projectName = project.name;
 
-                        projectRows.push({ rowDiv, videoFile, files, initialShortcutType: '', hasProjectSc, hasRootSc, rootScEntry });
+                        projectRows.push({ rowDiv, videoFile, files, initialShortcutType: '', hasProjectSc, hasRootSc, rootScEntry, scDate });
                     }
 
                     const groupHeader = document.createElement('h2');
@@ -5655,12 +5702,16 @@
                     }
 
                     for (const rowData of projectRows) {
-                        const { rowDiv, videoFile, files, hasProjectSc, hasRootSc, rootScEntry } = rowData;
+                        const { rowDiv, videoFile, files, hasProjectSc, hasRootSc, rootScEntry, scDate } = rowData;
 
                         rowDiv.appendChild(createRowActionBar(videoFile.name, project.path, videoFile.subfolder, rowDiv, project.name));
                         const dateInfo = document.createElement('div');
                         dateInfo.className = 'date-info';
-                        dateInfo.textContent = `Created: ${new Date(videoFile.lastModified).toLocaleString()}`;
+                        if (currentMode === 'update-playlist-root' && scDate) {
+                            dateInfo.textContent = `Shortcut: ${new Date(scDate).toLocaleString()}`;
+                        } else {
+                            dateInfo.textContent = `Created: ${new Date(videoFile.lastModified).toLocaleString()}`;
+                        }
                         rowDiv.appendChild(dateInfo);
 
 
