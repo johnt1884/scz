@@ -5172,53 +5172,80 @@
             if (!dateStr) return NaN;
             let mtimeStr = dateStr.trim();
 
-            // Handle DD/MM/YYYY format
-            const ddmmyyyyMatch = mtimeStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(.*)$/);
-            if (ddmmyyyyMatch) {
-                const day = ddmmyyyyMatch[1].padStart(2, '0');
-                const month = ddmmyyyyMatch[2].padStart(2, '0');
-                const year = ddmmyyyyMatch[3];
-                const rest = ddmmyyyyMatch[4].trim();
+            // Handle DD/MM/YYYY or MM/DD/YYYY formats
+            const dateMatch = mtimeStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})(.*)$/);
+            if (dateMatch) {
+                let v1 = parseInt(dateMatch[1]);
+                let v2 = parseInt(dateMatch[2]);
+                let year = dateMatch[3];
+                if (year.length === 2) year = "20" + year;
+                const rest = dateMatch[4].trim();
 
-                // Reformat to YYYY-MM-DD for reliable parsing
-                mtimeStr = `${year}-${month}-${day}`;
+                let day, month;
+                if (v1 > 12) {
+                    day = v1; month = v2;
+                } else if (v2 > 12) {
+                    month = v1; day = v2;
+                } else {
+                    day = v1; month = v2; // Ambiguous, assume UK format
+                }
+
+                mtimeStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                 if (rest) {
-                    const cleanRest = rest.trim();
-                    if (cleanRest.includes(' ') && !cleanRest.includes('T')) {
-                        mtimeStr += 'T' + cleanRest.replace(' ', 'T');
-                    } else if (!cleanRest.includes('T') && cleanRest.match(/^\d{2}:\d{2}/)) {
-                        mtimeStr += 'T' + cleanRest;
-                    } else {
-                        mtimeStr += (cleanRest.startsWith('T') ? '' : 'T') + cleanRest;
+                    const timeMatch = rest.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?(\s*[AP]M)?/i);
+                    if (timeMatch) {
+                        let hh = parseInt(timeMatch[1]);
+                        const mm = timeMatch[2];
+                        const ss = timeMatch[3] || "00";
+                        const ampm = timeMatch[4];
+
+                        if (ampm) {
+                            if (ampm.toUpperCase().includes('PM') && hh < 12) hh += 12;
+                            if (ampm.toUpperCase().includes('AM') && hh === 12) hh = 0;
+                        }
+                        mtimeStr += `T${String(hh).padStart(2, '0')}:${mm}:${ss}`;
                     }
                 }
             }
 
-            // Handle space between date and time for ISO compatibility
+            // Handle space between date and time for ISO-like strings
             if (mtimeStr.includes(' ') && !mtimeStr.includes('T')) {
-                mtimeStr = mtimeStr.replace(' ', 'T');
+                mtimeStr = mtimeStr.replace(/\s+/g, 'T');
             }
+
+            // Final ISO normalization
+            mtimeStr = mtimeStr.replace(/\s+/g, '');
+
             // If no timezone is provided, assume UTC as per instructions
             if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.includes('+') && !mtimeStr.includes('-')) {
                 mtimeStr += 'Z';
             }
-            return new Date(mtimeStr).getTime();
+
+            const ts = new Date(mtimeStr).getTime();
+            if (isNaN(ts)) {
+                // Last ditch effort for weird formats
+                return new Date(dateStr).getTime();
+            }
+            return ts;
         }
 
         function getShortcutDate(videoName, dateMap) {
-            const baseName = videoName.substring(0, videoName.lastIndexOf('.'));
+            if (!videoName || !dateMap) return null;
+            const vLower = videoName.toLowerCase();
+            const lastDot = vLower.lastIndexOf('.');
+            const baseName = lastDot !== -1 ? vLower.substring(0, lastDot) : vLower;
+
             const namesToCheck = [
-                videoName.toLowerCase() + ".lnk",
-                videoName.toLowerCase() + ".ink",
-                videoName.toLowerCase() + " - shortcut.lnk",
-                videoName.toLowerCase()
+                vLower + ".lnk",
+                vLower + ".ink",
+                vLower + " - shortcut.lnk",
+                vLower,
+                baseName + ".lnk",
+                baseName + ".ink",
+                baseName + " - shortcut.lnk",
+                baseName
             ];
-            if (baseName) {
-                namesToCheck.push(baseName.toLowerCase() + ".lnk");
-                namesToCheck.push(baseName.toLowerCase() + ".ink");
-                namesToCheck.push(baseName.toLowerCase() + " - shortcut.lnk");
-                namesToCheck.push(baseName.toLowerCase());
-            }
+
             for (const n of namesToCheck) {
                 if (dateMap.has(n)) return dateMap.get(n);
             }
@@ -5638,7 +5665,7 @@
                             scDate = getShortcutDate(videoFile.name, rootShortcutDates);
                             // Fallback to project-level dates if not found in root dates
                             if (scDate === null) {
-                                scDate = allShortcutDates.get(videoFile.name.toLowerCase()) || null;
+                                scDate = getShortcutDate(videoFile.name, allShortcutDates);
                             }
                             if (scDate !== null) {
                                 hasRootSc = true;
@@ -5652,25 +5679,17 @@
                                     continue;
                                 }
                             } else if (currentMode === 'update-playlist-root') {
-                                const vNameLower = videoFile.name.toLowerCase();
-                                const vBaseLower = videoFile.name.substring(0, videoFile.name.lastIndexOf('.')).toLowerCase();
-
-                                const isExisting = originalPlaylistShortcuts.some(s => {
-                                    const scFile = s.split(/[\\/]/).pop().toLowerCase();
-                                    const scBase = scFile.replace(/\.(lnk|ink)$/i, "");
-                                    return scFile === vNameLower || scFile === vNameLower + ".lnk" || scFile === vNameLower + ".ink" ||
-                                           scBase === vNameLower || scBase === vBaseLower;
-                                });
-
                                 const effectiveDate = scDate;
-                                const isNew = effectiveDate && (!playlistCreationTime || effectiveDate > playlistCreationTime);
+                                // In update-playlist-root mode, we ONLY want to see shortcuts that are NEWER than the cutoff date.
+                                // This prevents showing "old" shortcuts that the user has already processed and are already in the playlist.
+                                const isNew = effectiveDate && (!playlistCreationTime || (effectiveDate > (playlistCreationTime + 1000)));
 
-                                if (!isExisting && !isNew) {
-                                    // Not in original playlist and not new based on cutoff
+                                if (!isNew) {
+                                    // Not a new shortcut based on cutoff
                                     continue;
                                 }
 
-                                if (!hasRootSc && !isNew) {
+                                if (!hasRootSc) {
                                     loadErrors.push({ project: project.path, video: videoFile.name, reason: "No root shortcut found (Update Playlist Mode)" });
                                     continue;
                                 }
