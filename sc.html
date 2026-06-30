@@ -1180,6 +1180,7 @@
         let g_rootHandle;
         let currentMode = '';
         let canvases = new Map();
+        let allShortcutDates = new Map(); // Key: videoName (lower), Value: timestamp
 
         // Make globals available on window for testing/debugging
         window.allVideoFiles = allVideoFiles;
@@ -5069,6 +5070,14 @@
                 }
                 if (part.startsWith('backup_original:')) {
                     sel.backupOriginal = (part.substring(16).trim() === 'true');
+                } else if (part.startsWith('sc_mtime:')) {
+                    let mtimeStr = part.substring(9).trim();
+                    if (mtimeStr.includes(' ') && !mtimeStr.includes('T')) mtimeStr = mtimeStr.replace(' ', 'T');
+                    if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.includes('+') && !mtimeStr.includes('-')) mtimeStr += 'Z';
+                    const mtime = new Date(mtimeStr).getTime();
+                    if (!isNaN(mtime)) {
+                        allShortcutDates.set(videoName.toLowerCase(), mtime);
+                    }
                 }
                             }
                         });
@@ -5221,6 +5230,7 @@
             createdObjectUrls = [];
             canvases.clear();
             shortcutSelections.clear();
+            allShortcutDates.clear();
             initialShortcutSelections.clear();
             videoCategories.clear();
             editModeRotatedVideos.clear();
@@ -5347,6 +5357,10 @@
                             parts.slice(1).forEach(part => {
                                 if (part.startsWith('sc_mtime:')) {
                                     let mtimeStr = part.substring(9).trim();
+                                    // Handle space between date and time for ISO compatibility
+                                    if (mtimeStr.includes(' ') && !mtimeStr.includes('T')) {
+                                        mtimeStr = mtimeStr.replace(' ', 'T');
+                                    }
                                     // If no timezone is provided, assume UTC as per instructions
                                     if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.includes('+') && !mtimeStr.includes('-')) {
                                         mtimeStr += 'Z';
@@ -5361,33 +5375,38 @@
                     });
                     console.log(`Loaded ${rootShortcutDates.size} shortcut dates from root misc.txt.`);
                 } catch (e) {
-                    console.warn("Could not read root misc.txt for shortcut dates, falling back to sc/ directory scan:", e);
-                    try {
-                        let scDir = null;
-                        if (g_rootHandle.name.toLowerCase() === 'sc') {
-                            scDir = g_rootHandle;
-                        } else {
-                            // Try to find 'sc' folder case-insensitively
-                            for await (const entry of g_rootHandle.values()) {
-                                if (entry.kind === 'directory' && entry.name.toLowerCase() === 'sc') {
-                                    scDir = entry;
-                                    break;
-                                }
+                    console.warn("Could not read root misc.txt for shortcut dates.", e);
+                }
+
+                // Always try to supplement or override with real file modification dates from sc/ directory
+                try {
+                    let scDir = null;
+                    if (g_rootHandle.name.toLowerCase() === 'sc') {
+                        scDir = g_rootHandle;
+                    } else {
+                        // Try to find 'sc' folder case-insensitively
+                        for await (const entry of g_rootHandle.values()) {
+                            if (entry.kind === 'directory' && entry.name.toLowerCase() === 'sc') {
+                                scDir = entry;
+                                break;
                             }
                         }
+                    }
 
-                        if (scDir) {
-                            for await (const entry of scDir.values()) {
-                                if (entry.kind === 'file') {
-                                    const file = await entry.getFile();
+                    if (scDir) {
+                        for await (const entry of scDir.values()) {
+                            if (entry.kind === 'file') {
+                                const file = await entry.getFile();
+                                // Prefer misc.txt value if it exists, as it's the intended metadata
+                                if (!rootShortcutDates.has(entry.name.toLowerCase())) {
                                     rootShortcutDates.set(entry.name.toLowerCase(), file.lastModified);
                                 }
                             }
-                            console.log(`Loaded ${rootShortcutDates.size} shortcut dates from sc/ directory scan.`);
                         }
-                    } catch (e2) {
-                        console.warn("Fallback sc/ directory scan failed:", e2);
+                        console.log(`Supplemented with shortcut dates from sc/ directory scan. Total: ${rootShortcutDates.size}`);
                     }
+                } catch (e2) {
+                    console.warn("Fallback sc/ directory scan failed:", e2);
                 }
             }
 
@@ -5592,6 +5611,10 @@
                         let scDate = null;
                         if (currentMode === 'update-playlist-root') {
                             scDate = getShortcutDate(videoFile.name, rootShortcutDates);
+                            // Fallback to project-level dates if not found in root dates
+                            if (scDate === null) {
+                                scDate = allShortcutDates.get(videoFile.name.toLowerCase()) || null;
+                            }
                             if (scDate !== null) {
                                 hasRootSc = true;
                             }
@@ -5604,17 +5627,26 @@
                                     continue;
                                 }
                             } else if (currentMode === 'update-playlist-root') {
-                                if (!hasRootSc) {
-                                    loadErrors.push({ project: project.path, video: videoFile.name, reason: "No root shortcut found (Update Playlist Mode)" });
-                                    continue;
-                                }
+                                const vNameLower = videoFile.name.toLowerCase();
+                                const vBaseLower = videoFile.name.substring(0, videoFile.name.lastIndexOf('.')).toLowerCase();
+
+                                const isExisting = originalPlaylistShortcuts.some(s => {
+                                    const scFile = s.split(/[\\/]/).pop().toLowerCase();
+                                    const scBase = scFile.replace(/\.(lnk|ink)$/i, "");
+                                    return scFile === vNameLower || scFile === vNameLower + ".lnk" || scFile === vNameLower + ".ink" ||
+                                           scBase === vNameLower || scBase === vBaseLower;
+                                });
+
                                 const effectiveDate = scDate;
-                                if (!effectiveDate) {
-                                    loadErrors.push({ project: project.path, video: videoFile.name, reason: "No shortcut date found for update-playlist-root" });
+                                const isNew = effectiveDate && (!playlistCreationTime || effectiveDate > playlistCreationTime);
+
+                                if (!isExisting && !isNew) {
+                                    // Not in original playlist and not new based on cutoff
                                     continue;
                                 }
-                                if (playlistCreationTime && effectiveDate <= playlistCreationTime) {
-                                    loadErrors.push({ project: project.path, video: videoFile.name, reason: "Shortcut date before playlist cutoff" });
+
+                                if (!hasRootSc && !isNew) {
+                                    loadErrors.push({ project: project.path, video: videoFile.name, reason: "No root shortcut found (Update Playlist Mode)" });
                                     continue;
                                 }
                             } else if (hasAnyShortcuts) {
