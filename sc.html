@@ -1067,6 +1067,21 @@
         </div>
     </div>
 
+    <div id="cutoff-modal" class="modal">
+        <div class="modal-content" style="max-width: 400px;">
+            <h2 style="margin-top: 0;">Playlist Cut-off Date/Time</h2>
+            <p>Any shortcuts more recent than this time will be considered new.</p>
+            <div style="margin: 20px 0;">
+                <label for="cutoff-datetime" style="display: block; margin-bottom: 8px;">Date/Time (Local):</label>
+                <input type="datetime-local" id="cutoff-datetime" step="1" style="width: 100%; padding: 8px; box-sizing: border-box;">
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: 10px;">
+                <button id="cutoff-cancel-btn" class="bar-button" style="background-color: #f44336; color: white;">Cancel</button>
+                <button id="cutoff-confirm-btn" class="bar-button" style="background-color: #43a047; color: white;">Confirm</button>
+            </div>
+        </div>
+    </div>
+
 
     <script>
         const thumbnailContainer = document.getElementById('thumbnail-container');
@@ -1085,6 +1100,10 @@
         const createPlaylistLoadBtn = document.getElementById('create-playlist-load-btn');
         const createPlaylistRootLoadBtn = document.getElementById('create-playlist-root-load-btn');
         const updatePlaylistRootLoadBtn = document.getElementById('update-playlist-root-load-btn');
+        const cutoffModal = document.getElementById('cutoff-modal');
+        const cutoffDatetimeInput = document.getElementById('cutoff-datetime');
+        const cutoffConfirmBtn = document.getElementById('cutoff-confirm-btn');
+        const cutoffCancelBtn = document.getElementById('cutoff-cancel-btn');
         const shortcutScriptBtn = document.getElementById('shortcut-script-btn');
         const createPlaylistBtn = document.getElementById('create-playlist-btn');
         const deleteShortcutsBtn = document.getElementById('delete-shortcuts-btn');
@@ -1161,6 +1180,7 @@
         let g_rootHandle;
         let currentMode = '';
         let canvases = new Map();
+        let allShortcutDates = new Map(); // Key: videoName (lower), Value: timestamp
 
         // Make globals available on window for testing/debugging
         window.allVideoFiles = allVideoFiles;
@@ -1228,6 +1248,123 @@
         let initialVideoCategories = new Map(); // Key: projectPath + '|' + videoName, Value: Set of category names
         let projectCategories = new Map(); // Key: projectPath, Value: Set of category names
         let globalSavedCategories = new Set(JSON.parse(localStorage.getItem('globalSavedCategories') || '[]'));
+
+        // Browser Fallback for File System Access API (Firefox/Brave support)
+        class VirtualFileSystemHandle {
+            constructor(name, kind) {
+                this.name = name;
+                this.kind = kind;
+            }
+        }
+
+        class VirtualFileHandle extends VirtualFileSystemHandle {
+            constructor(file, path) {
+                super(file.name, 'file');
+                this.file = file;
+                this.path = path;
+            }
+            async getFile() { return this.file; }
+        }
+
+        class VirtualDirectoryHandle extends VirtualFileSystemHandle {
+            constructor(name, path, allFiles = []) {
+                super(name, 'directory');
+                this.path = path; // relative path within the virtual root
+                this._allFiles = allFiles; // flat list of all VirtualFileHandle in the subtree
+            }
+
+            async *values() {
+                const seen = new Set();
+                for (const vfh of this._allFiles) {
+                    const relPath = vfh.path.substring(this.path ? this.path.length + 1 : 0);
+                    const parts = relPath.split(/[\\/]/);
+                    const firstPart = parts[0];
+                    if (!firstPart || seen.has(firstPart)) continue;
+                    seen.add(firstPart);
+
+                    if (parts.length === 1) {
+                        yield vfh;
+                    } else {
+                        const subPath = this.path ? `${this.path}/${firstPart}` : firstPart;
+                        const subFiles = this._allFiles.filter(f => f.path.startsWith(subPath + '/') || f.path === subPath);
+                        yield new VirtualDirectoryHandle(firstPart, subPath, subFiles);
+                    }
+                }
+            }
+
+            async getDirectoryHandle(name, options = {}) {
+                const subPath = this.path ? `${this.path}/${name}` : name;
+                const subFiles = this._allFiles.filter(f => f.path.startsWith(subPath + '/') || f.path === subPath);
+                if (subFiles.length === 0 && !options.create) throw new Error('Directory not found');
+                return new VirtualDirectoryHandle(name, subPath, subFiles);
+            }
+
+            async getFileHandle(name, options = {}) {
+                const filePath = this.path ? `${this.path}/${name}` : name;
+                const vfh = this._allFiles.find(f => f.path === filePath);
+                if (!vfh && !options.create) throw new Error('File not found');
+                return vfh;
+            }
+
+            async resolve(possibleDescendant) {
+                if (!(possibleDescendant instanceof VirtualFileSystemHandle)) return null;
+                if (possibleDescendant.path === this.path) return [];
+                if (possibleDescendant.path.startsWith(this.path + '/')) {
+                    return possibleDescendant.path.substring(this.path ? this.path.length + 1 : 0).split('/');
+                }
+                return null;
+            }
+        }
+
+        const pickerFallback = {
+            async showDirectoryPicker() {
+                console.log('showDirectoryPicker called');
+                if (window.showDirectoryPicker) {
+                    console.log('Using native showDirectoryPicker');
+                    return await window.showDirectoryPicker();
+                }
+                console.log('Using fallback for showDirectoryPicker');
+                return new Promise((resolve, reject) => {
+                    const input = document.createElement('input');
+                    input.type = 'file';
+                    input.webkitdirectory = true;
+                    input.onchange = () => {
+                        if (!input.files.length) { reject(new Error('AbortError')); return; }
+                        const files = Array.from(input.files).map(f => {
+                            // webkitRelativePath is "folder/sub/file.txt"
+                            const path = f.webkitRelativePath;
+                            return new VirtualFileHandle(f, path);
+                        });
+                        const rootName = files[0].path.split('/')[0];
+                        resolve(new VirtualDirectoryHandle(rootName, rootName, files));
+                    };
+                    input.click();
+                });
+            },
+            async showOpenFilePicker(options = {}) {
+                console.log('showOpenFilePicker called', options);
+                if (window.showOpenFilePicker) {
+                    console.log('Using native showOpenFilePicker');
+                    return await window.showOpenFilePicker(options);
+                }
+                console.log('Using fallback for showOpenFilePicker');
+                return new Promise((resolve, reject) => {
+                    const input = document.createElement('input');
+                    input.type = 'file';
+                    if (options.multiple) input.multiple = true;
+                    if (options.types && options.types[0] && options.types[0].accept) {
+                        const accept = Object.values(options.types[0].accept).flat().join(',');
+                        input.accept = accept;
+                    }
+                    input.onchange = () => {
+                        if (!input.files.length) { reject(new Error('AbortError')); return; }
+                        const handles = Array.from(input.files).map(f => new VirtualFileHandle(f, f.name));
+                        resolve(handles);
+                    };
+                    input.click();
+                });
+            }
+        };
 
         const mainContainer = document.querySelector('.main-container');
         const showDatesCheckbox = document.getElementById('show-dates-checkbox');
@@ -2813,7 +2950,7 @@
 
             loadButton.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     g_rootHandle = null;
                     currentMode = 'directory';
@@ -2826,7 +2963,7 @@
 
             loadScButton.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     g_rootHandle = null;
                     currentMode = 'sc';
@@ -2841,7 +2978,7 @@
 
             updatePlaylistRootLoadBtn.addEventListener('click', async () => {
                 try {
-                    const [fileHandle] = await window.showOpenFilePicker({
+                    const [fileHandle] = await pickerFallback.showOpenFilePicker({
                         types: [{
                             description: 'Playlist files',
                             accept: { 
@@ -2852,23 +2989,53 @@
                         }]
                     });
                     const file = await fileHandle.getFile();
-                    playlistCreationTime = file.lastModified;
                     let text = await file.text();
                     // Remove UTF-8 BOM if present
                     if (text.charCodeAt(0) === 0xFEFF) {
                         text = text.substring(1);
                     }
                     // Basic M3U parsing, skipping comments
-                    originalPlaylistShortcuts = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+                    originalPlaylistShortcuts = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#')).map(s => {
+                        const file = s.split(/[\\/]/).pop();
+                        const projectDir = s.split(/[\\/]/).slice(-3, -2)[0] || ""; // Assuming ..\Project\sc\video.lnk
+                        return { full: s, file: file.toLowerCase(), project: projectDir.toLowerCase() };
+                    });
 
-                    const dirHandle = await window.showDirectoryPicker();
+                    // Show cutoff modal
+                    const localDate = new Date(file.lastModified);
+                    const offset = localDate.getTimezoneOffset();
+                    localDate.setMinutes(localDate.getMinutes() - offset);
+                    const defaultVal = localDate.toISOString().slice(0, 19);
+                    cutoffDatetimeInput.value = defaultVal;
+                    cutoffModal.style.display = 'flex';
+
+                    const cutoffPromise = new Promise((resolve, reject) => {
+                        cutoffConfirmBtn.onclick = () => {
+                            const val = cutoffDatetimeInput.value;
+                            if (val && val !== defaultVal) {
+                                resolve(new Date(val).getTime());
+                            } else {
+                                // Use the exact original modification time to avoid UI precision loss
+                                resolve(file.lastModified);
+                            }
+                            cutoffModal.style.display = 'none';
+                        };
+                        cutoffCancelBtn.onclick = () => {
+                            reject(new Error('AbortError'));
+                            cutoffModal.style.display = 'none';
+                        };
+                    });
+
+                    playlistCreationTime = await cutoffPromise;
+
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     currentMode = 'update-playlist-root';
                     setSelectionType('playlist-sc');
                     setVisibilityForMode(currentMode);
                     await renderVideosInternal(false, sortSelector.value, true);
                 } catch (err) {
-                    if (err.name !== 'AbortError') {
+                    if (err.message !== 'AbortError' && err.name !== 'AbortError') {
                         console.error('Failed to open playlist or directory:', err);
                     }
                 }
@@ -2877,7 +3044,7 @@
 
             loadLatestVideosButton.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     g_rootHandle = null;
                     currentMode = 'latest-videos';
@@ -2948,7 +3115,7 @@
 
             loadRootScButton.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     g_rootHandle = null;
                     currentMode = 'root-sc';
@@ -2963,7 +3130,7 @@
 
             createPlaylistLoadBtn.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     currentMode = 'playlist';
                     setSelectionType('both-sc');
@@ -2978,7 +3145,7 @@
 
             createPlaylistRootLoadBtn.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     currentMode = 'playlist-root';
                     setSelectionType('playlist-sc');
@@ -5026,6 +5193,11 @@
                 }
                 if (part.startsWith('backup_original:')) {
                     sel.backupOriginal = (part.substring(16).trim() === 'true');
+                } else if (part.startsWith('sc_mtime:')) {
+                    const mtime = parseShortcutDate(part.substring(9).trim());
+                    if (!isNaN(mtime)) {
+                        allShortcutDates.set(videoName.toLowerCase(), mtime);
+                    }
                 }
                             }
                         });
@@ -5119,20 +5291,102 @@
             return false;
         }
 
-        function getShortcutDate(videoName, dateMap) {
-            const baseName = videoName.substring(0, videoName.lastIndexOf('.'));
-            const namesToCheck = [
-                videoName.toLowerCase() + ".lnk",
-                videoName.toLowerCase() + ".ink",
-                videoName.toLowerCase() + " - shortcut.lnk",
-                videoName.toLowerCase()
-            ];
-            if (baseName) {
-                namesToCheck.push(baseName.toLowerCase() + ".lnk");
-                namesToCheck.push(baseName.toLowerCase() + ".ink");
-                namesToCheck.push(baseName.toLowerCase() + " - shortcut.lnk");
-                namesToCheck.push(baseName.toLowerCase());
+        function parseShortcutDate(dateStr) {
+            if (!dateStr) return NaN;
+            let mtimeStr = dateStr.trim();
+
+            // 1. Detect and handle YYYY-MM-DD vs DD/MM/YYYY or MM/DD/YYYY
+            const isoMatch = mtimeStr.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(.*)$/);
+            const ukMatch = mtimeStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})(.*)$/);
+
+            let year, month, day, rest;
+
+            if (isoMatch) {
+                year = isoMatch[1];
+                month = isoMatch[2].padStart(2, '0');
+                day = isoMatch[3].padStart(2, '0');
+                rest = isoMatch[4].trim();
+                // If it starts with T, remove it for the regex below
+                if (rest.toUpperCase().startsWith('T')) rest = rest.substring(1).trim();
+            } else if (ukMatch) {
+                let v1 = parseInt(ukMatch[1]);
+                let v2 = parseInt(ukMatch[2]);
+                year = ukMatch[3];
+                if (year.length === 2) year = "20" + year;
+                rest = ukMatch[4].trim();
+
+                if (v1 > 12) {
+                    day = String(v1).padStart(2, '0');
+                    month = String(v2).padStart(2, '0');
+                } else if (v2 > 12) {
+                    month = String(v1).padStart(2, '0');
+                    day = String(v2).padStart(2, '0');
+                } else {
+                    day = String(v1).padStart(2, '0');
+                    month = String(v2).padStart(2, '0');
+                }
             }
+
+            if (year && month && day) {
+                mtimeStr = `${year}-${month}-${day}`;
+                if (rest) {
+                    const timeMatch = rest.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?(\.\d+)?(\s*[AP]M)?/i);
+                    if (timeMatch) {
+                        let hh = parseInt(timeMatch[1]);
+                        const mm = timeMatch[2];
+                        const ss = timeMatch[3] || "00";
+                        const ms = timeMatch[4] || "";
+                        const ampm = timeMatch[5];
+
+                        if (ampm) {
+                            if (ampm.toUpperCase().includes('PM') && hh < 12) hh += 12;
+                            if (ampm.toUpperCase().includes('AM') && hh === 12) hh = 0;
+                        }
+                        mtimeStr += `T${String(hh).padStart(2, '0')}:${mm}:${ss}${ms}`;
+
+                        const tzPart = rest.substring(timeMatch[0].length).trim();
+                        if (tzPart.match(/^[+-]\d{2}:?\d{2}$/) || tzPart.toUpperCase() === 'Z') {
+                            mtimeStr += tzPart;
+                        }
+                    }
+                }
+            }
+
+            if (mtimeStr && !mtimeStr.endsWith('Z') && !mtimeStr.match(/[+-]\d{2}:?\d{2}$/)) {
+                if (mtimeStr.includes(' ')) mtimeStr = mtimeStr.replace(/\s+/g, 'T');
+                if (!mtimeStr.includes('T')) mtimeStr += 'T00:00:00';
+                if (mtimeStr.endsWith('.')) mtimeStr = mtimeStr.slice(0, -1);
+                mtimeStr += 'Z';
+            }
+
+            const ts = new Date(mtimeStr).getTime();
+            if (isNaN(ts)) {
+                let fallbackStr = dateStr.trim();
+                if (fallbackStr.match(/^\d{4}-\d{2}-\d{2}/) && !fallbackStr.includes('Z') && !fallbackStr.includes('+')) {
+                    fallbackStr += 'Z';
+                }
+                return new Date(fallbackStr).getTime();
+            }
+            return ts;
+        }
+
+        function getShortcutDate(videoName, dateMap) {
+            if (!videoName || !dateMap) return null;
+            const vLower = videoName.toLowerCase();
+            const lastDot = vLower.lastIndexOf('.');
+            const baseName = lastDot !== -1 ? vLower.substring(0, lastDot) : vLower;
+
+            const namesToCheck = [
+                vLower + ".lnk",
+                vLower + ".ink",
+                vLower + " - shortcut.lnk",
+                vLower,
+                baseName + ".lnk",
+                baseName + ".ink",
+                baseName + " - shortcut.lnk",
+                baseName
+            ];
+
             for (const n of namesToCheck) {
                 if (dateMap.has(n)) return dateMap.get(n);
             }
@@ -5178,6 +5432,7 @@
             createdObjectUrls = [];
             canvases.clear();
             shortcutSelections.clear();
+            allShortcutDates.clear();
             initialShortcutSelections.clear();
             videoCategories.clear();
             editModeRotatedVideos.clear();
@@ -5269,7 +5524,7 @@
             } else if (!isNewOnly && (isProject || projectFolders.length > 0)) {
                 if (confirm("Would you like to select the root folder to enable root shortcut detection?")) {
                     try {
-                        const rootHandle = await window.showDirectoryPicker();
+                        const rootHandle = await pickerFallback.showDirectoryPicker();
                         g_rootHandle = rootHandle;
                         rootScData = await getRootScData(g_rootHandle);
                     } catch (e) {}
@@ -5301,46 +5556,52 @@
                         const parts = line.trim().split('|');
                         if (parts.length >= 2) {
                             const scName = parts[0].toLowerCase();
+                            let project = "", video = "", mtime = NaN;
                             parts.slice(1).forEach(part => {
-                                if (part.startsWith('sc_mtime:')) {
-                                    const mtimeStr = part.substring(9).trim();
-                                    const mtime = new Date(mtimeStr).getTime();
-                                    if (!isNaN(mtime)) {
-                                        rootShortcutDates.set(scName, mtime);
-                                    }
-                                }
+                                if (part.startsWith('sc_project:')) project = part.substring(11).toLowerCase();
+                                else if (part.startsWith('sc_video:')) video = part.substring(9).toLowerCase();
+                                else if (part.startsWith('sc_mtime:')) mtime = parseShortcutDate(part.substring(9).trim());
                             });
+                            if (!isNaN(mtime)) {
+                                if (project && video) rootShortcutDates.set(`${project}|${video}`, mtime);
+                                else rootShortcutDates.set(scName, mtime);
+                            }
                         }
                     });
                     console.log(`Loaded ${rootShortcutDates.size} shortcut dates from root misc.txt.`);
                 } catch (e) {
-                    console.warn("Could not read root misc.txt for shortcut dates, falling back to sc/ directory scan:", e);
-                    try {
-                        let scDir = null;
-                        if (g_rootHandle.name.toLowerCase() === 'sc') {
-                            scDir = g_rootHandle;
-                        } else {
-                            // Try to find 'sc' folder case-insensitively
-                            for await (const entry of g_rootHandle.values()) {
-                                if (entry.kind === 'directory' && entry.name.toLowerCase() === 'sc') {
-                                    scDir = entry;
-                                    break;
-                                }
+                    console.warn("Could not read root misc.txt for shortcut dates.", e);
+                }
+
+                // Always try to supplement or override with real file modification dates from sc/ directory
+                try {
+                    let scDir = null;
+                    if (g_rootHandle.name.toLowerCase() === 'sc') {
+                        scDir = g_rootHandle;
+                    } else {
+                        // Try to find 'sc' folder case-insensitively
+                        for await (const entry of g_rootHandle.values()) {
+                            if (entry.kind === 'directory' && entry.name.toLowerCase() === 'sc') {
+                                scDir = entry;
+                                break;
                             }
                         }
+                    }
 
-                        if (scDir) {
-                            for await (const entry of scDir.values()) {
-                                if (entry.kind === 'file') {
-                                    const file = await entry.getFile();
+                    if (scDir) {
+                        for await (const entry of scDir.values()) {
+                            if (entry.kind === 'file') {
+                                const file = await entry.getFile();
+                                // Prefer misc.txt value if it exists, as it's the intended metadata
+                                if (!rootShortcutDates.has(entry.name.toLowerCase())) {
                                     rootShortcutDates.set(entry.name.toLowerCase(), file.lastModified);
                                 }
                             }
-                            console.log(`Loaded ${rootShortcutDates.size} shortcut dates from sc/ directory scan.`);
                         }
-                    } catch (e2) {
-                        console.warn("Fallback sc/ directory scan failed:", e2);
+                        console.log(`Supplemented with shortcut dates from sc/ directory scan. Total: ${rootShortcutDates.size}`);
                     }
+                } catch (e2) {
+                    console.warn("Fallback sc/ directory scan failed:", e2);
                 }
             }
 
@@ -5544,7 +5805,15 @@
                         // In update-playlist-root mode, we ALSO check if the shortcut file exists directly in sc/
                         let scDate = null;
                         if (currentMode === 'update-playlist-root') {
-                            scDate = getShortcutDate(videoFile.name, rootShortcutDates);
+                            // Try precise project|video lookup first
+                            scDate = rootShortcutDates.get(`${project.name.toLowerCase()}|${videoFile.name.toLowerCase()}`) || null;
+                            if (scDate === null) {
+                                scDate = getShortcutDate(videoFile.name, rootShortcutDates);
+                            }
+                            // Fallback to project-level dates if not found in root dates
+                            if (scDate === null) {
+                                scDate = getShortcutDate(videoFile.name, allShortcutDates);
+                            }
                             if (scDate !== null) {
                                 hasRootSc = true;
                             }
@@ -5557,17 +5826,33 @@
                                     continue;
                                 }
                             } else if (currentMode === 'update-playlist-root') {
+                                const vNameLower = videoFile.name.toLowerCase();
+                                const vBaseLower = videoFile.name.substring(0, videoFile.name.lastIndexOf('.')).toLowerCase();
+                                const pNameLower = project.name.toLowerCase();
+
+                                const isExisting = originalPlaylistShortcuts.some(s => {
+                                    if (s.project && s.project !== pNameLower) return false;
+                                    const scFile = s.file;
+                                    const scBase = scFile.replace(/\.(lnk|ink| - shortcut\.lnk)$/i, "");
+                                    return scFile === vNameLower || scFile === vNameLower + ".lnk" || scFile === vNameLower + ".ink" ||
+                                           scBase === vNameLower || scBase === vBaseLower ||
+                                           (vBaseLower && (scBase === vBaseLower || scFile === vBaseLower));
+                                });
+
+                                const effectiveDate = scDate;
+                                // In update-playlist-root mode, we ONLY want to see shortcuts that are NEWER than the cutoff date.
+                                // AND they should not already be in the playlist.
+                                const isNew = effectiveDate && (!playlistCreationTime || (effectiveDate > (playlistCreationTime + 1000)));
+
+                                console.log(`[UpdatePlaylist] Checking ${videoFile.name}: scDate=${effectiveDate ? new Date(effectiveDate).toISOString() : 'null'}, cutoff=${playlistCreationTime ? new Date(playlistCreationTime).toISOString() : 'null'}, isNew=${isNew}, isExisting=${isExisting}`);
+
+                                if (!isNew || isExisting) {
+                                    // Not a new shortcut or already in playlist
+                                    continue;
+                                }
+
                                 if (!hasRootSc) {
                                     loadErrors.push({ project: project.path, video: videoFile.name, reason: "No root shortcut found (Update Playlist Mode)" });
-                                    continue;
-                                }
-                                const effectiveDate = scDate;
-                                if (!effectiveDate) {
-                                    loadErrors.push({ project: project.path, video: videoFile.name, reason: "No shortcut date found for update-playlist-root" });
-                                    continue;
-                                }
-                                if (playlistCreationTime && effectiveDate <= playlistCreationTime) {
-                                    loadErrors.push({ project: project.path, video: videoFile.name, reason: "Shortcut date before playlist cutoff" });
                                     continue;
                                 }
                             } else if (hasAnyShortcuts) {
@@ -5595,7 +5880,7 @@
                         rowDiv.dataset.projectPath = project.path;
                         rowDiv.dataset.projectName = project.name;
 
-                        projectRows.push({ rowDiv, videoFile, files, initialShortcutType: '', hasProjectSc, hasRootSc, rootScEntry });
+                        projectRows.push({ rowDiv, videoFile, files, initialShortcutType: '', hasProjectSc, hasRootSc, rootScEntry, scDate });
                     }
 
                     const groupHeader = document.createElement('h2');
@@ -5655,12 +5940,16 @@
                     }
 
                     for (const rowData of projectRows) {
-                        const { rowDiv, videoFile, files, hasProjectSc, hasRootSc, rootScEntry } = rowData;
+                        const { rowDiv, videoFile, files, hasProjectSc, hasRootSc, rootScEntry, scDate } = rowData;
 
                         rowDiv.appendChild(createRowActionBar(videoFile.name, project.path, videoFile.subfolder, rowDiv, project.name));
                         const dateInfo = document.createElement('div');
                         dateInfo.className = 'date-info';
-                        dateInfo.textContent = `Created: ${new Date(videoFile.lastModified).toLocaleString()}`;
+                        if (currentMode === 'update-playlist-root' && scDate) {
+                            dateInfo.textContent = `Shortcut: ${new Date(scDate).toLocaleString()}`;
+                        } else {
+                            dateInfo.textContent = `Created: ${new Date(videoFile.lastModified).toLocaleString()}`;
+                        }
                         rowDiv.appendChild(dateInfo);
 
 
@@ -5686,9 +5975,11 @@
                         const isRoot = hasRootSc || (rootScEntry === 'ROOT' || rootScEntry === 'BOTH');
                         const isSub = hasProjectSc === true || (rootScEntry === 'BOTH');
 
-                        if (isRoot && isSub) initialShortcutType = 'both-sc';
-                        else if (isRoot) initialShortcutType = 'root-sc';
-                        else if (isSub) initialShortcutType = 'subfolder-sc';
+                        if (currentMode !== 'update-playlist-root') {
+                            if (isRoot && isSub) initialShortcutType = 'both-sc';
+                            else if (isRoot) initialShortcutType = 'root-sc';
+                            else if (isSub) initialShortcutType = 'subfolder-sc';
+                        }
 
                         const key = project.path + '|' + videoFile.name;
                         const loadedEditState = editModeRotatedVideos.get(key);
@@ -6030,7 +6321,7 @@
             if (!g_rootHandle) {
                 if (confirm("Would you like to select the root folder to enable root shortcut detection?")) {
                     try {
-                        const rootHandle = await window.showDirectoryPicker();
+                        const rootHandle = await pickerFallback.showDirectoryPicker();
                         g_rootHandle = rootHandle;
                     } catch (e) {}
                 }
@@ -6465,7 +6756,8 @@
 
             if (currentMode === 'update-playlist-root' && originalPlaylistShortcuts.length > 0) {
                 scriptLines.push('# --- Adding Original Playlist Shortcuts ---');
-                originalPlaylistShortcuts.forEach(scPath => {
+                originalPlaylistShortcuts.forEach(scPathObj => {
+                    const scPath = scPathObj.full;
                     const scFileName = scPath.split(/[\\/]/).pop();
                     const videoName = scFileName.replace(/\.(lnk|ink)$/i, '');
                     scriptLines.push(`Add-PlaylistEntry -path '${escapePSString(scPath)}' -rotation '0' -multiplier 1 -rotationKey '${escapePSString(videoName)}'`);
