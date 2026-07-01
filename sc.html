@@ -1249,6 +1249,123 @@
         let projectCategories = new Map(); // Key: projectPath, Value: Set of category names
         let globalSavedCategories = new Set(JSON.parse(localStorage.getItem('globalSavedCategories') || '[]'));
 
+        // Browser Fallback for File System Access API (Firefox/Brave support)
+        class VirtualFileSystemHandle {
+            constructor(name, kind) {
+                this.name = name;
+                this.kind = kind;
+            }
+        }
+
+        class VirtualFileHandle extends VirtualFileSystemHandle {
+            constructor(file, path) {
+                super(file.name, 'file');
+                this.file = file;
+                this.path = path;
+            }
+            async getFile() { return this.file; }
+        }
+
+        class VirtualDirectoryHandle extends VirtualFileSystemHandle {
+            constructor(name, path, allFiles = []) {
+                super(name, 'directory');
+                this.path = path; // relative path within the virtual root
+                this._allFiles = allFiles; // flat list of all VirtualFileHandle in the subtree
+            }
+
+            async *values() {
+                const seen = new Set();
+                for (const vfh of this._allFiles) {
+                    const relPath = vfh.path.substring(this.path ? this.path.length + 1 : 0);
+                    const parts = relPath.split(/[\\/]/);
+                    const firstPart = parts[0];
+                    if (!firstPart || seen.has(firstPart)) continue;
+                    seen.add(firstPart);
+
+                    if (parts.length === 1) {
+                        yield vfh;
+                    } else {
+                        const subPath = this.path ? `${this.path}/${firstPart}` : firstPart;
+                        const subFiles = this._allFiles.filter(f => f.path.startsWith(subPath + '/') || f.path === subPath);
+                        yield new VirtualDirectoryHandle(firstPart, subPath, subFiles);
+                    }
+                }
+            }
+
+            async getDirectoryHandle(name, options = {}) {
+                const subPath = this.path ? `${this.path}/${name}` : name;
+                const subFiles = this._allFiles.filter(f => f.path.startsWith(subPath + '/') || f.path === subPath);
+                if (subFiles.length === 0 && !options.create) throw new Error('Directory not found');
+                return new VirtualDirectoryHandle(name, subPath, subFiles);
+            }
+
+            async getFileHandle(name, options = {}) {
+                const filePath = this.path ? `${this.path}/${name}` : name;
+                const vfh = this._allFiles.find(f => f.path === filePath);
+                if (!vfh && !options.create) throw new Error('File not found');
+                return vfh;
+            }
+
+            async resolve(possibleDescendant) {
+                if (!(possibleDescendant instanceof VirtualFileSystemHandle)) return null;
+                if (possibleDescendant.path === this.path) return [];
+                if (possibleDescendant.path.startsWith(this.path + '/')) {
+                    return possibleDescendant.path.substring(this.path ? this.path.length + 1 : 0).split('/');
+                }
+                return null;
+            }
+        }
+
+        const pickerFallback = {
+            async showDirectoryPicker() {
+                console.log('showDirectoryPicker called');
+                if (window.showDirectoryPicker) {
+                    console.log('Using native showDirectoryPicker');
+                    return await window.showDirectoryPicker();
+                }
+                console.log('Using fallback for showDirectoryPicker');
+                return new Promise((resolve, reject) => {
+                    const input = document.createElement('input');
+                    input.type = 'file';
+                    input.webkitdirectory = true;
+                    input.onchange = () => {
+                        if (!input.files.length) { reject(new Error('AbortError')); return; }
+                        const files = Array.from(input.files).map(f => {
+                            // webkitRelativePath is "folder/sub/file.txt"
+                            const path = f.webkitRelativePath;
+                            return new VirtualFileHandle(f, path);
+                        });
+                        const rootName = files[0].path.split('/')[0];
+                        resolve(new VirtualDirectoryHandle(rootName, rootName, files));
+                    };
+                    input.click();
+                });
+            },
+            async showOpenFilePicker(options = {}) {
+                console.log('showOpenFilePicker called', options);
+                if (window.showOpenFilePicker) {
+                    console.log('Using native showOpenFilePicker');
+                    return await window.showOpenFilePicker(options);
+                }
+                console.log('Using fallback for showOpenFilePicker');
+                return new Promise((resolve, reject) => {
+                    const input = document.createElement('input');
+                    input.type = 'file';
+                    if (options.multiple) input.multiple = true;
+                    if (options.types && options.types[0] && options.types[0].accept) {
+                        const accept = Object.values(options.types[0].accept).flat().join(',');
+                        input.accept = accept;
+                    }
+                    input.onchange = () => {
+                        if (!input.files.length) { reject(new Error('AbortError')); return; }
+                        const handles = Array.from(input.files).map(f => new VirtualFileHandle(f, f.name));
+                        resolve(handles);
+                    };
+                    input.click();
+                });
+            }
+        };
+
         const mainContainer = document.querySelector('.main-container');
         const showDatesCheckbox = document.getElementById('show-dates-checkbox');
         const showNumbersCheckbox = document.getElementById('show-numbers-checkbox');
@@ -2833,7 +2950,7 @@
 
             loadButton.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     g_rootHandle = null;
                     currentMode = 'directory';
@@ -2846,7 +2963,7 @@
 
             loadScButton.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     g_rootHandle = null;
                     currentMode = 'sc';
@@ -2861,7 +2978,7 @@
 
             updatePlaylistRootLoadBtn.addEventListener('click', async () => {
                 try {
-                    const [fileHandle] = await window.showOpenFilePicker({
+                    const [fileHandle] = await pickerFallback.showOpenFilePicker({
                         types: [{
                             description: 'Playlist files',
                             accept: { 
@@ -2911,7 +3028,7 @@
 
                     playlistCreationTime = await cutoffPromise;
 
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     currentMode = 'update-playlist-root';
                     setSelectionType('playlist-sc');
@@ -2927,7 +3044,7 @@
 
             loadLatestVideosButton.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     g_rootHandle = null;
                     currentMode = 'latest-videos';
@@ -2998,7 +3115,7 @@
 
             loadRootScButton.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     g_rootHandle = null;
                     currentMode = 'root-sc';
@@ -3013,7 +3130,7 @@
 
             createPlaylistLoadBtn.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     currentMode = 'playlist';
                     setSelectionType('both-sc');
@@ -3028,7 +3145,7 @@
 
             createPlaylistRootLoadBtn.addEventListener('click', async () => {
                 try {
-                    const dirHandle = await window.showDirectoryPicker();
+                    const dirHandle = await pickerFallback.showDirectoryPicker();
                     currentDirHandle = dirHandle;
                     currentMode = 'playlist-root';
                     setSelectionType('playlist-sc');
@@ -5407,7 +5524,7 @@
             } else if (!isNewOnly && (isProject || projectFolders.length > 0)) {
                 if (confirm("Would you like to select the root folder to enable root shortcut detection?")) {
                     try {
-                        const rootHandle = await window.showDirectoryPicker();
+                        const rootHandle = await pickerFallback.showDirectoryPicker();
                         g_rootHandle = rootHandle;
                         rootScData = await getRootScData(g_rootHandle);
                     } catch (e) {}
@@ -6204,7 +6321,7 @@
             if (!g_rootHandle) {
                 if (confirm("Would you like to select the root folder to enable root shortcut detection?")) {
                     try {
-                        const rootHandle = await window.showDirectoryPicker();
+                        const rootHandle = await pickerFallback.showDirectoryPicker();
                         g_rootHandle = rootHandle;
                     } catch (e) {}
                 }
