@@ -1250,104 +1250,98 @@
         let globalSavedCategories = new Set(JSON.parse(localStorage.getItem('globalSavedCategories') || '[]'));
 
         // Browser Fallback for File System Access API (Firefox/Brave support)
-        class VirtualFileSystemHandle {
-            constructor(name, kind) {
-                this.name = name;
-                this.kind = kind;
-            }
+        function createVirtualFileHandle(file, path) {
+            return {
+                name: file.name,
+                kind: 'file',
+                path: path,
+                getFile: async () => file
+            };
         }
 
-        class VirtualFileHandle extends VirtualFileSystemHandle {
-            constructor(file, path) {
-                super(file.name, 'file');
-                this.file = file;
-                this.path = path;
-            }
-            async getFile() { return this.file; }
-        }
+        function createVirtualDirectoryHandle(name, path, allFiles) {
+            return {
+                name: name,
+                kind: 'directory',
+                path: path,
+                values: async function* () {
+                    const seen = new Set();
+                    for (const vfh of allFiles) {
+                        const relPath = vfh.path.substring(path ? path.length + 1 : 0);
+                        if (!relPath) continue;
+                        const parts = relPath.split(/[\\/]/);
+                        const firstPart = parts[0];
+                        if (!firstPart || seen.has(firstPart)) continue;
+                        seen.add(firstPart);
 
-        class VirtualDirectoryHandle extends VirtualFileSystemHandle {
-            constructor(name, path, allFiles = []) {
-                super(name, 'directory');
-                this.path = path; // relative path within the virtual root
-                this._allFiles = allFiles; // flat list of all VirtualFileHandle in the subtree
-            }
-
-            async *values() {
-                const seen = new Set();
-                for (const vfh of this._allFiles) {
-                    const relPath = vfh.path.substring(this.path ? this.path.length + 1 : 0);
-                    const parts = relPath.split(/[\\/]/);
-                    const firstPart = parts[0];
-                    if (!firstPart || seen.has(firstPart)) continue;
-                    seen.add(firstPart);
-
-                    if (parts.length === 1) {
-                        yield vfh;
-                    } else {
-                        const subPath = this.path ? `${this.path}/${firstPart}` : firstPart;
-                        const subFiles = this._allFiles.filter(f => f.path.startsWith(subPath + '/') || f.path === subPath);
-                        yield new VirtualDirectoryHandle(firstPart, subPath, subFiles);
+                        if (parts.length === 1) {
+                            yield vfh;
+                        } else {
+                            const subPath = path ? `${path}/${firstPart}` : firstPart;
+                            const subFiles = allFiles.filter(f => f.path.startsWith(subPath + '/') || f.path === subPath);
+                            yield createVirtualDirectoryHandle(firstPart, subPath, subFiles);
+                        }
                     }
+                },
+                getDirectoryHandle: async function(subName, options = {}) {
+                    const subPath = path ? `${path}/${subName}` : subName;
+                    const subFiles = allFiles.filter(f => f.path.startsWith(subPath + '/') || f.path === subPath);
+                    if (subFiles.length === 0 && !options.create) throw new Error(`Directory '${subName}' not found`);
+                    return createVirtualDirectoryHandle(subName, subPath, subFiles);
+                },
+                getFileHandle: async function(subName, options = {}) {
+                    const filePath = path ? `${path}/${subName}` : subName;
+                    const vfh = allFiles.find(f => f.path === filePath);
+                    if (!vfh && !options.create) throw new Error(`File '${subName}' not found`);
+                    return vfh;
+                },
+                resolve: async function(possibleDescendant) {
+                    if (!possibleDescendant || possibleDescendant.path === undefined) return null;
+                    if (possibleDescendant.path === path) return [];
+                    if (possibleDescendant.path.startsWith(path + '/')) {
+                        return possibleDescendant.path.substring(path ? path.length + 1 : 0).split(/[\\/]/);
+                    }
+                    return null;
                 }
-            }
-
-            async getDirectoryHandle(name, options = {}) {
-                const subPath = this.path ? `${this.path}/${name}` : name;
-                const subFiles = this._allFiles.filter(f => f.path.startsWith(subPath + '/') || f.path === subPath);
-                if (subFiles.length === 0 && !options.create) throw new Error('Directory not found');
-                return new VirtualDirectoryHandle(name, subPath, subFiles);
-            }
-
-            async getFileHandle(name, options = {}) {
-                const filePath = this.path ? `${this.path}/${name}` : name;
-                const vfh = this._allFiles.find(f => f.path === filePath);
-                if (!vfh && !options.create) throw new Error('File not found');
-                return vfh;
-            }
-
-            async resolve(possibleDescendant) {
-                if (!(possibleDescendant instanceof VirtualFileSystemHandle)) return null;
-                if (possibleDescendant.path === this.path) return [];
-                if (possibleDescendant.path.startsWith(this.path + '/')) {
-                    return possibleDescendant.path.substring(this.path ? this.path.length + 1 : 0).split('/');
-                }
-                return null;
-            }
+            };
         }
 
         const pickerFallback = {
             async showDirectoryPicker() {
-                console.log('showDirectoryPicker called');
-                if (window.showDirectoryPicker) {
-                    console.log('Using native showDirectoryPicker');
-                    return await window.showDirectoryPicker();
+                if (window.showDirectoryPicker && window.isSecureContext) {
+                    try {
+                        return await window.showDirectoryPicker();
+                    } catch (e) {
+                        if (e.name !== 'AbortError') console.warn('Native showDirectoryPicker failed, using fallback', e);
+                        else throw e;
+                    }
                 }
-                console.log('Using fallback for showDirectoryPicker');
                 return new Promise((resolve, reject) => {
                     const input = document.createElement('input');
                     input.type = 'file';
                     input.webkitdirectory = true;
                     input.onchange = () => {
-                        if (!input.files.length) { reject(new Error('AbortError')); return; }
-                        const files = Array.from(input.files).map(f => {
-                            // webkitRelativePath is "folder/sub/file.txt"
-                            const path = f.webkitRelativePath;
-                            return new VirtualFileHandle(f, path);
+                        const files = Array.from(input.files || []);
+                        if (!files.length) { reject(new Error('AbortError')); return; }
+                        const handles = files.map(f => {
+                            const p = f.webkitRelativePath || f.name;
+                            return createVirtualFileHandle(f, p);
                         });
-                        const rootName = files[0].path.split('/')[0];
-                        resolve(new VirtualDirectoryHandle(rootName, rootName, files));
+                        const rootName = handles[0].path.split(/[\\/]/)[0];
+                        resolve(createVirtualDirectoryHandle(rootName, rootName, handles));
                     };
                     input.click();
                 });
             },
             async showOpenFilePicker(options = {}) {
-                console.log('showOpenFilePicker called', options);
-                if (window.showOpenFilePicker) {
-                    console.log('Using native showOpenFilePicker');
-                    return await window.showOpenFilePicker(options);
+                if (window.showOpenFilePicker && window.isSecureContext) {
+                    try {
+                        return await window.showOpenFilePicker(options);
+                    } catch (e) {
+                        if (e.name !== 'AbortError') console.warn('Native showOpenFilePicker failed, using fallback', e);
+                        else throw e;
+                    }
                 }
-                console.log('Using fallback for showOpenFilePicker');
                 return new Promise((resolve, reject) => {
                     const input = document.createElement('input');
                     input.type = 'file';
@@ -1357,8 +1351,9 @@
                         input.accept = accept;
                     }
                     input.onchange = () => {
-                        if (!input.files.length) { reject(new Error('AbortError')); return; }
-                        const handles = Array.from(input.files).map(f => new VirtualFileHandle(f, f.name));
+                        const files = Array.from(input.files || []);
+                        if (!files.length) { reject(new Error('AbortError')); return; }
+                        const handles = files.map(f => createVirtualFileHandle(f, f.name));
                         resolve(handles);
                     };
                     input.click();
@@ -5434,6 +5429,10 @@
             shortcutSelections.clear();
             allShortcutDates.clear();
             initialShortcutSelections.clear();
+            if (currentMode !== 'update-playlist-root') {
+                originalPlaylistShortcuts = [];
+                playlistCreationTime = null;
+            }
             videoCategories.clear();
             editModeRotatedVideos.clear();
             initialVideoCategories.clear();
@@ -6756,11 +6755,16 @@
 
             if (currentMode === 'update-playlist-root' && originalPlaylistShortcuts.length > 0) {
                 scriptLines.push('# --- Adding Original Playlist Shortcuts ---');
-                originalPlaylistShortcuts.forEach(scPathObj => {
-                    const scPath = scPathObj.full;
-                    const scFileName = scPath.split(/[\\/]/).pop();
-                    const videoName = scFileName.replace(/\.(lnk|ink)$/i, '');
-                    scriptLines.push(`Add-PlaylistEntry -path '${escapePSString(scPath)}' -rotation '0' -multiplier 1 -rotationKey '${escapePSString(videoName)}'`);
+                originalPlaylistShortcuts.forEach(scItem => {
+                    let scPath = "";
+                    if (typeof scItem === 'string') scPath = scItem;
+                    else if (scItem && scItem.full) scPath = scItem.full;
+
+                    if (scPath) {
+                        const scFileName = scPath.split(/[\\/]/).pop();
+                        const videoName = scFileName.replace(/\.(lnk|ink)$/i, '');
+                        scriptLines.push(`Add-PlaylistEntry -path '${escapePSString(scPath)}' -rotation '0' -multiplier 1 -rotationKey '${escapePSString(videoName)}'`);
+                    }
                 });
                 scriptLines.push('');
             }
